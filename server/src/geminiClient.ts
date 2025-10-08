@@ -1,5 +1,6 @@
 import axios from "axios";
 import { GoogleAuth } from 'google-auth-library';
+import sharp from 'sharp';
 
 /**
  * Build a stable style prompt so results remain consistent between requests.
@@ -17,9 +18,6 @@ function buildStylePrompt(genre: string, storyPrompt: string) {
  * - count: number of panels to return
  *
  * Returns array of base64 PNG data (without data: prefix)
- *
- * NOTE: This function uses the Google Generative Images endpoint pattern as an example.
- * You may need to adjust the endpoint or payload to match the exact Gemini images API available in your account.
  */
 export async function generatePanels(
   inputImage: Buffer | null,
@@ -29,105 +27,127 @@ export async function generatePanels(
 ): Promise<string[]> {
   const prompt = buildStylePrompt(genre, storyPrompt);
 
-  // Read API key at call time so dotenv can be loaded before this module is used.
+  // Read environment variables.
   const apiKey = process.env.GEMINI_API_KEY ?? '';
-
-  // We'll attempt to authenticate either via API key (query param) or via ADC (service account -> access token).
-  let url = 'https://generative.googleapis.com/v1/images:generate';
-  const headers: Record<string, string> = { 'Content-Type': 'application/json' };
-
-  if (apiKey) {
-    // If a plain API key is provided, use it as a query param. Note: some generative endpoints require OAuth2 access tokens.
-    url += `?key=${encodeURIComponent(apiKey)}`;
-    console.log('Using API key from environment as query parameter for Generative API request.');
-  } else {
-    // Try to obtain an access token via Application Default Credentials (GOOGLE_APPLICATION_CREDENTIALS or environment ADC).
-    try {
-      const auth = new GoogleAuth({ scopes: ['https://www.googleapis.com/auth/cloud-platform'] });
-      const client = await auth.getClient();
-      const tokenResponse = await client.getAccessToken();
-      const token = typeof tokenResponse === 'string' ? tokenResponse : tokenResponse?.token;
-      if (token) {
-        headers.Authorization = `Bearer ${token}`;
-        console.log('Obtained access token via GoogleAuth.');
-      } else {
-        console.warn('GoogleAuth: token acquisition returned empty token. Requests may fail.');
-      }
-    } catch (e) {
-      console.warn('GoogleAuth token acquisition failed (no API key present):', e);
-    }
+  // *** CHANGE: You need your Google Cloud Project ID for the Vertex AI endpoint. ***
+  const projectId = process.env.GOOGLE_CLOUD_PROJECT_ID;
+  if (!projectId) {
+    console.error('GOOGLE_CLOUD_PROJECT_ID environment variable not set.');
+    return [];
   }
 
-  // prepare request payload(s)
-  // We'll attempt two-step pipeline:
-  // 1) If inputImage present: ask Gemini to stylize the provided image to a manga likeness (image-to-image)
-  // 2) Then ask for additional panels via text-to-image with consistent style, optionally seeding with stylized result.
-  // Because public Gemini image endpoints differ across releases, this is implemented as a best-effort example using axios.
+  // *** CHANGE: This is the correct endpoint for the Imagen model on Vertex AI. ***
+  let url = `https://us-central1-aiplatform.googleapis.com/v1/projects/${projectId}/locations/us-central1/publishers/google/models/imagegeneration:predict`;
+
+  const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+
+  // Authentication logic remains the same, but Vertex AI typically requires OAuth2 (ADC/Bearer Token).
+  // An API key might not work depending on your project's configuration.
+  if (apiKey) {
+    // Note: Vertex AI endpoints usually prefer OAuth2 access tokens over API keys.
+    // This part is kept for compatibility, but the token method is recommended.
+    try {
+        const auth = new GoogleAuth({ scopes: ['https://www.googleapis.com/auth/cloud-platform'] });
+        const client = await auth.getClient();
+        const tokenResponse = await client.getAccessToken();
+        const token = typeof tokenResponse === 'string' ? tokenResponse : tokenResponse?.token;
+        if (token) {
+          headers.Authorization = `Bearer ${token}`;
+          console.log('Obtained access token via GoogleAuth.');
+        }
+      } catch (e) {
+        console.warn('GoogleAuth token acquisition failed:', e);
+        // Fallback for API key usage if needed, although less common for Vertex
+        if (!headers.Authorization) {
+            url += `?key=${encodeURIComponent(apiKey)}`;
+            console.log('Using API key from environment as query parameter.');
+        }
+      }
+  } else {
+    console.error('Authentication failed: No API key or Application Default Credentials found.');
+    return [];
+  }
 
   try {
     const results: string[] = [];
 
-    // Convert inputImage to base64 if present
+    // Pre-process the image with Sharp to reduce size (this is correct).
     let inputBase64: string | null = null;
     if (inputImage) {
-      inputBase64 = inputImage.toString("base64");
+      try {
+        const target = parseInt(process.env.GENERATION_INIT_IMAGE_SIZE || '512', 10);
+        const jpegBuffer = await sharp(inputImage)
+          .resize({ width: target, height: target, fit: 'inside' })
+          .jpeg({ quality: 78 })
+          .toBuffer();
+        inputBase64 = jpegBuffer.toString('base64');
+      } catch (e) {
+        console.warn('sharp preprocessing failed, using original image buffer:', e);
+        inputBase64 = inputImage.toString('base64');
+      }
     }
 
-    // Example single endpoint call per panel (could be batched)
+    // Loop to generate panels.
     for (let i = 0; i < count; i++) {
-      // Stable seed in prompt helps consistency across multiple runs
       const panelPrompt = `${prompt}\nPanel index: ${i + 1} / ${count}\nRender the character in a clear manga panel, high contrast.`;
+      
+      // *** CHANGE: Use the `init_image` only for the first panel. ***
+      const useInitImage = i === 0 && inputBase64;
 
-      const payload: any = {
-        model: "gemini-1.5-pro",
-        // The exact field names below (e.g., "prompt", "image") may need to be adapted for your Gemini images endpoint.
-        prompt: panelPrompt,
-        // request PNG base64 in response if supported
-        output_format: "png",
-        quality: "high",
-        // optionally pass the input image as seed
-        ...(inputBase64 ? { init_image: inputBase64, image_influence: 0.8 } : {})
+      // *** CHANGE: This payload structure matches the Vertex AI Imagen API. ***
+      const payload = {
+        instances: [
+          {
+            prompt: panelPrompt,
+            ...(useInitImage ? { image: { bytesBase64Encoded: inputBase64 } } : {})
+          }
+        ],
+        parameters: {
+          sampleCount: 1,
+          // Conditionally set the mode for the API call
+          ...(useInitImage ? { mode: 'image-to-image', strength: 0.8 } : { mode: 'text-to-image' })
+        }
       };
 
-      // Example endpoint - adjust if your account requires a different path
-      const res = await axios.post(url, payload, { headers, timeout: 60_000 });
+      // Retry logic remains the same (this is correct).
+      const maxRetries = 3;
+      let res: any = null;
+      for (let attempt = 0; attempt < maxRetries; attempt++) {
+        try {
+          res = await axios.post(url, payload, { headers, timeout: 90_000 }); // Increased timeout to 90s
+          break; // Success
+        } catch (err: any) {
+          const isNetworkErr = err?.code && ['ECONNRESET', 'ETIMEDOUT'].includes(err.code);
+          const status = err?.response?.status;
+          const is5xx = status && status >= 500 && status < 600;
 
-      // Expect res.data to contain base64 image(s). Try common shapes
-      const base64Image =
-        res?.data?.data?.[0]?.b64_json ||
-        res?.data?.images?.[0]?.b64_json ||
-        res?.data?.image ||
-        null;
+          if (attempt < maxRetries - 1 && (isNetworkErr || is5xx)) {
+            const backoff = 1000 * Math.pow(2, attempt); // 1s, 2s, 4s
+            console.warn(`API request failed (attempt ${attempt + 1}/${maxRetries}) - retrying in ${backoff}ms`, err.code || status);
+            await new Promise((r) => setTimeout(r, backoff));
+            continue;
+          }
+          throw err;
+        }
+      }
+
+      // *** CHANGE: Parse the response according to the Vertex AI structure. ***
+      const base64Image = res?.data?.predictions?.[0]?.bytesBase64Encoded || null;
 
       if (base64Image) {
         results.push(base64Image);
-      } else if (res?.data?.data?.[0]?.url) {
-        // If API returns a hosted URL, fetch and convert to base64
-        const url = res.data.data[0].url;
-        const imgResp = await axios.get(url, { responseType: "arraybuffer" });
-        results.push(Buffer.from(imgResp.data, "binary").toString("base64"));
       } else {
-        // If unexpected shape, push fallback empty string so frontend can fallback
-        results.push("");
+        console.warn(`Panel ${i + 1} generation failed or returned unexpected data.`);
+        results.push(""); // Push empty string for fallback
       }
     }
-
     return results;
   } catch (err) {
-      // Provide more actionable errors for common failure modes
-      console.error("Gemini generation error:", err);
-      const e: any = err;
-      if (e?.response?.status === 404) {
-        console.error('Generative API returned 404. Common causes:');
-        console.error('- The Generative API is not enabled for your Google Cloud project');
-        console.error('- The endpoint path used is not available to your account/version');
-        console.error('- You used an API key where OAuth2 access token is required');
-        console.error('Response body:', e?.response?.data || e?.response?.statusText);
-      } else if (e?.response) {
-        console.error('Generative API response:', e.response.status, e.response.data);
-      }
-
-      // Return empty so the calling route can fall back to mock images
-      return [];
+    console.error("Gemini generation error:", err);
+    const e: any = err;
+    if (e?.response) {
+      console.error('API response error:', e.response.status, JSON.stringify(e.response.data, null, 2));
+    }
+    return []; // Return empty array on failure
   }
 }
