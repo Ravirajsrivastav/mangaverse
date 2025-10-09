@@ -3,7 +3,7 @@ import cors from "cors";
 import multer from "multer";
 import dotenv from "dotenv";
 import sharp from "sharp";
-import { generatePanels } from "./geminiClient";
+import { generatePanels } from "./newclient";
 
 dotenv.config();
 
@@ -39,7 +39,7 @@ app.post(
       const generatedBase64 = await generatePanels(buffer, genre, prompt, count);
 
       // If Gemini failed or returned empty, fallback to mock hosted images
-      let images: string[] = [];
+      let images: string[] | string;
       if (generatedBase64 && generatedBase64.length > 0 && generatedBase64.some(Boolean)) {
         images = generatedBase64.map((b64) =>
           b64.startsWith("http") ? b64 : `data:image/png;base64,${b64}`
